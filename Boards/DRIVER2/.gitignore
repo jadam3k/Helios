@@ -1,0 +1,34 @@
+# Local KiCad settings, locks and recovery files
+*.kicad_prl
+*.lck
+~*
+_autosave-*
+*.bak
+*.backup
+*.backup_*
+*.kicad_pcb-bak
+*.kicad_sch-bak
+*-backups/
+.history/
+
+# Autorouter exchange files and temporary routing plans
+*.dsn
+*.ses
+*_plan.json
+temp-*
+
+# Generated working reports and plugin preferences
+DRC-*.json
+VERIFICATION.json
+fabrication-toolkit-options.json
+
+# Operating system and Python cache files
+Thumbs.db
+Desktop.ini
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# STM32CubeIDE build caches
+/Filmware/Debug/
+/Filmware/Release/

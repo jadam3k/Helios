@@ -1,0 +1,427 @@
+// Full Helios MPPT source source text. Each FILE marker names its Arduino tab.
+
+// ================= FILE: Config.h =================
+#pragma once
+#include <stdint.h>
+#ifndef HELIOS_BATTERY_CONFIRMED
+#define HELIOS_BATTERY_CONFIRMED 0
+#endif
+#ifndef HELIOS_CALIBRATION_CONFIRMED
+#define HELIOS_CALIBRATION_CONFIRMED 0
+#endif
+namespace cfg {
+// Charging requires an identified battery and measured sensor calibration.
+// Set these to true ONLY after checking the corresponding real hardware.
+constexpr bool batteryConfirmed = HELIOS_BATTERY_CONFIRMED != 0;
+constexpr bool calibrationConfirmed = HELIOS_CALIBRATION_CONFIRMED != 0;
+constexpr bool autoStart = true;
+constexpr bool uartTelemetry = false; // PA2 TX / PA3 RX, not RJ45.
+// Reference for the UNCHANGED board: protected 3S Li-ion, 4.20 V/cell maximum.
+// This profile is NOT for 4S LiFePO4, 12 V AGM, or 3S LiFePO4.
+constexpr float chargeVoltage = 12.55f;
+constexpr float batteryTripVoltage = 12.75f;
+constexpr float batteryMinimum = 10.5f;
+constexpr float rechargeVoltage = 12.15f;
+constexpr float maxConverterA = 2.0f;
+constexpr float tripConverterA = 2.5f;
+constexpr float tripLoadA = 5.0f; // Software threshold; not a board current rating.
+constexpr float terminationA = 0.15f;
+constexpr float panelMaximum = 28.0f; // Verify capacitor ratings and cold Voc.
+constexpr float startHeadroom = 2.0f;
+constexpr float stopHeadroom = 0.6f;
+constexpr float loadOffVoltage = 10.8f;
+constexpr float loadOnVoltage = 11.7f;
+constexpr float minimumC = 5.0f, maximumC = 40.0f;
+constexpr uint32_t qualificationMs = 3000, terminationMs = 300000;
+constexpr uint32_t chargeTimeoutMs = 6UL * 60 * 60 * 1000;
+constexpr uint32_t pwmHz = 40000, deadTimeNs = 500;
+constexpr bool synchronous = false; // Default: low-side body-diode freewheel.
+constexpr float inductanceH = 47e-6f;
+constexpr float vddaCalibration = 1.0f;
+constexpr float voltageRatio = 105600.0f / 5600.0f;
+constexpr float batteryVoltageCalibration = 1.0f, panelVoltageCalibration = 1.0f;
+constexpr float shuntOhm = 0.003f, currentGain = 20.0f;
+constexpr float converterZeroCorrectionV = 0.0f, loadZeroCorrectionV = 0.0f;
+constexpr float ntcR25 = 10000.0f, ntcPullup = 10000.0f;
+constexpr float ntcBeta = 3950.0f; // TH1 unspecified: replace with actual data.
+constexpr float dutyMinimum = 0.03f, dutyMaximum = 0.90f;
+static_assert(chargeVoltage < batteryTripVoltage, "Charge/trip voltage order");
+static_assert(batteryTripVoltage < 13.2f, "Original AP2210 supply operating limit");
+static_assert(maxConverterA < tripConverterA, "Current limit/trip order");
+}
+
+// ================= FILE: Control.h =================
+#pragma once
+#include <stdint.h>
+#include <math.h>
+#include "Config.h"
+namespace helios {
+inline float clamp(float x,float a,float b) { return x<a?a:(x>b?b:x); }
+inline bool elapsed(uint32_t n,uint32_t t,uint32_t d) { return uint32_t(n-t)>=d; }
+enum class State:uint8_t { Unconfigured, Stopped, Waiting, Qualifying, Charging, Complete, Fault };
+enum class Fault:uint8_t { None, Sample, Battery, Panel, Current, Reverse, Temperature, Timeout, Heartbeat, PowerGood };
+struct Sample {
+    float battery=0,panel=0,converter=0,load=0,temperature=0;
+    uint32_t at=0;
+    bool valid=false;
+};
+struct Output {
+    State state=State::Stopped;
+    Fault fault=Fault::None;
+    float duty=0,power=0,batteryCurrent=0;
+    bool load=false;
+};
+class Controller {
+public:
+    void start() { requested_=true; }
+    void stop() { requested_=false;out_.duty=0;out_.load=false; }
+    void trip(Fault f) { out_.fault=f;out_.state=State::Fault;out_.duty=0;out_.load=false;requested_=false; }
+    // CLEAR never starts charging: START is a separate action.
+    void clear() { if(out_.state==State::Fault) {out_=Output();requested_=false;} }
+    Output output()const {return out_;}
+    Output update(const Sample&s,uint32_t now,bool configured) {
+        if(out_.state==State::Fault)return out_;
+        if(!configured) {out_=Output();out_.state=State::Unconfigured;return out_;}
+        if(!requested_) {out_=Output();return out_;}
+        if(!s.valid||elapsed(now,s.at,21)||!isfinite(s.battery)||!isfinite(s.panel)||
+            !isfinite(s.converter)||!isfinite(s.load)||!isfinite(s.temperature))return fail(Fault::Sample);
+        if(s.battery<cfg::batteryMinimum||s.battery>=cfg::batteryTripVoltage)return fail(Fault::Battery);
+        if(s.panel<0||s.panel>=cfg::panelMaximum)return fail(Fault::Panel);
+        if(s.converter>cfg::tripConverterA||s.load>cfg::tripLoadA)return fail(Fault::Current);
+        if(s.converter<-.35f||s.load<-.35f)return fail(Fault::Reverse);
+        if(s.temperature<cfg::minimumC||s.temperature>cfg::maximumC)return fail(Fault::Temperature);
+        out_.power=s.battery*s.converter;out_.batteryCurrent=s.converter-s.load;
+        if(s.battery<=cfg::loadOffVoltage)out_.load=false;
+        else if(s.battery>=cfg::loadOnVoltage)out_.load=true;
+        if(out_.state==State::Complete) {
+            out_.duty=0;
+            if(s.battery>cfg::rechargeVoltage)return out_;
+            out_.state=State::Waiting;
+        }
+        const bool running=out_.state==State::Charging;
+        const float headroom=running?cfg::stopHeadroom:cfg::startHeadroom;
+        if(s.panel<s.battery+headroom) {
+            out_.state=State::Waiting;out_.duty=0;tail_=false;return out_;
+        }
+        if(out_.state==State::Stopped||out_.state==State::Unconfigured||out_.state==State::Waiting) {
+            out_.state=State::Qualifying;sunAt_=now;out_.duty=0;
+        }
+        if(out_.state==State::Qualifying) {
+            if(!elapsed(now,sunAt_,cfg::qualificationMs))return out_;
+            out_.state=State::Charging;chargeAt_=now;tail_=false;
+            // Diode mode allows a gradual rise without actively sinking current.
+            out_.duty=clamp(s.battery/s.panel-.08f,cfg::dutyMinimum,cfg::dutyMaximum);
+            ceiling_=clamp(s.battery/s.panel+.06f,cfg::dutyMinimum,cfg::dutyMaximum);
+            previousPower_=out_.power;perturbAt_=now;lastStep_=now;direction_=1;
+        }
+        if(elapsed(now,chargeAt_,cfg::chargeTimeoutMs))return fail(Fault::Timeout);
+        if(s.battery>=cfg::chargeVoltage-.04f&&out_.batteryCurrent>=0&&out_.batteryCurrent<=cfg::terminationA) {
+            if(!tail_){tail_=true;tailAt_=now;}
+            if(elapsed(now,tailAt_,cfg::terminationMs)) {
+                out_.state=State::Complete;out_.duty=0;return out_;
+            }
+        }else tail_=false;
+        // Caller supplies a fresh sample each millisecond. Regulator is time-gated.
+        if(!elapsed(now,lastStep_,1))return out_;
+        lastStep_=now;
+        const float vError=cfg::chargeVoltage-s.battery;
+        const float iError=cfg::maxConverterA-s.converter;
+        if(vError<-.03f)voltageHold_=true;
+        if(voltageHold_) {
+            out_.duty=0;
+            if(vError<=.03f)return out_;
+            voltageHold_=false;
+            out_.duty=clamp(s.battery/s.panel-.08f,cfg::dutyMinimum,cfg::dutyMaximum);
+        }
+        if(vError<0||iError<0) {
+            out_.duty-=clamp(-vError*.008f+.0002f, .0002f,.004f);
+            if(iError<0)out_.duty-=clamp(-iError*.003f,0,.004f);
+            // Rebase P&O after limiting so a load change is not mistaken for a perturbation.
+            previousPower_=out_.power;perturbAt_=now;
+        }else {
+            if(elapsed(now,perturbAt_,250)) {
+                if(out_.power<previousPower_-.1f)direction_=-direction_;
+                ceiling_=clamp(ceiling_+direction_*.002f,cfg::dutyMinimum,cfg::dutyMaximum);
+                previousPower_=out_.power;perturbAt_=now;
+            }
+            if(vError>.02f&&iError>.05f)out_.duty+=.0005f;
+        }
+        // P&O varies a duty ceiling; CC and CV can always reduce actual duty.
+        out_.duty=clamp(out_.duty,cfg::dutyMinimum,ceiling_);
+        return out_;
+    }
+private:
+    Output fail(Fault f){trip(f);return out_;}
+    Output out_;
+    bool requested_=false,tail_=false,voltageHold_=false;
+    uint32_t sunAt_=0,chargeAt_=0,tailAt_=0,lastStep_=0,perturbAt_=0;
+    float ceiling_=0,previousPower_=0;
+    int direction_=1;
+};
+struct Compare {uint32_t high,low;};
+inline Compare compareFor(float duty,uint32_t arr,uint32_t gap) {
+    if(!(duty>0)||!isfinite(duty))return {0,arr+1};
+    const uint32_t high=uint32_t(clamp(duty,cfg::dutyMinimum,cfg::dutyMaximum)*arr);
+    return {high,high+gap<arr?high+gap:arr+1};
+}
+}
+
+// ================= FILE: PowerStage.h =================
+#pragma once
+#include <Arduino.h>
+#include "Control.h"
+class PowerStage {
+public:
+    void begin() {
+        __HAL_RCC_GPIOB_CLK_ENABLE();__HAL_RCC_TIM3_CLK_ENABLE();
+        TIM3->CR1=0;TIM3->CCER=0;
+        gpioOff();
+        uint32_t clock=HAL_RCC_GetPCLK1Freq();
+        if((RCC->CFGR&RCC_CFGR_PPRE1)!=0)clock*=2;
+        arr_=clock/(2*cfg::pwmHz);
+        gap_=uint32_t((uint64_t(clock)*cfg::deadTimeNs+999999999)/1000000000);
+        if(arr_<100||gap_==0||gap_>=arr_/10){valid_=false;return;}
+        TIM3->PSC=0;TIM3->ARR=arr_;
+        TIM3->CCR3=0;TIM3->CCR4=arr_+1;
+        // CH3 PWM1 and CH4 PWM2, both preloaded, single center-aligned counter.
+        TIM3->CCMR2=(6UL<<4)|TIM_CCMR2_OC3PE|(7UL<<12)|TIM_CCMR2_OC4PE;
+        TIM3->CR1=TIM_CR1_ARPE|TIM_CR1_CMS_0;
+        TIM3->EGR=TIM_EGR_UG;TIM3->SR=0;
+        valid_=true;
+    }
+    bool valid()const{return valid_;}
+    bool active()const{return active_;}
+    uint32_t top()const{return arr_;}
+    uint32_t gap()const{return gap_;}
+    void stop() {
+        TIM3->CCER=0;TIM3->CR1&=~TIM_CR1_CEN;
+        gpioOff();active_=false;
+    }
+    void apply(float duty,bool synchronous) {
+        if(!valid_||!(duty>0)||!isfinite(duty)){stop();return;}
+        auto c=helios::compareFor(duty,arr_,gap_);
+        if(!active_) {
+            // Short bootstrap refresh. With 47 uH and 12.6 V, 2 us implies
+            // about 0.54 A ideal reverse-current change. Validate actual pulse.
+            gpioOff();GPIOB->BSRR=GPIO_PIN_1;
+            delayMicroseconds(2);GPIOB->BSRR=uint32_t(GPIO_PIN_1)<<16;
+            TIM3->CCER=0;TIM3->CCR3=c.high;TIM3->CCR4=arr_+1;
+            TIM3->CNT=arr_;TIM3->EGR=TIM_EGR_UG;TIM3->SR=0;
+            GPIO_InitTypeDef g={};g.Pin=GPIO_PIN_0|GPIO_PIN_1;
+            g.Mode=GPIO_MODE_AF_PP;g.Pull=GPIO_PULLDOWN;g.Speed=GPIO_SPEED_FREQ_HIGH;g.Alternate=GPIO_AF2_TIM3;
+            HAL_GPIO_Init(GPIOB,&g);
+            TIM3->CCER=TIM_CCER_CC3E|TIM_CCER_CC4E;
+            TIM3->CR1|=TIM_CR1_CEN;active_=true;
+        }
+        const uint32_t irq=__get_PRIMASK();__disable_irq();
+        // UDIS prevents an update from latching one compare before the other.
+        TIM3->CR1|=TIM_CR1_UDIS;
+        TIM3->CCR3=c.high;TIM3->CCR4=synchronous?c.low:arr_+1;
+        TIM3->CR1&=~TIM_CR1_UDIS;
+        if(!irq)__enable_irq();
+    }
+private:
+    static void gpioOff() {
+        GPIOB->BSRR=uint32_t(GPIO_PIN_0|GPIO_PIN_1)<<16;
+        GPIO_InitTypeDef g={};g.Pin=GPIO_PIN_0|GPIO_PIN_1;
+        g.Mode=GPIO_MODE_OUTPUT_PP;g.Pull=GPIO_PULLDOWN;g.Speed=GPIO_SPEED_FREQ_HIGH;
+        HAL_GPIO_Init(GPIOB,&g);
+    }
+    volatile bool active_=false;
+    bool valid_=false;
+    uint32_t arr_=0,gap_=0;
+};
+
+// ================= FILE: HeliosMPPT.ino =================
+/* Helios MPPT / STM32L072CZT6 / original PCB / Arduino STM32 core.
+ * All four source files in this folder belong to this sketch.
+ * Configuration and calibration are in Config.h. No RJ45/8P8C link is used.
+ */
+#include <Arduino.h>
+#include <HardwareTimer.h>
+#include <stm32l0xx_ll_adc.h>
+#include <math.h>
+#include "Config.h"
+#include "Control.h"
+#include "PowerStage.h"
+#if !defined(STM32L072xx)
+#error "Select Generic STM32L072CZ, LQFP48, 192 KB Flash."
+#endif
+
+PowerStage stage;
+helios::Controller controller;
+HardwareTimer heartbeatTimer(TIM21);
+Uart console(PA3,PA2); // STM32 core 3.1 UART2. No fitted debug connector.
+
+struct Telemetry {
+    float vdda,batteryV,panelV,converterA,loadA,batteryA,temperatureC,ntcOhm;
+    float outputW,requestedDuty,appliedDuty;
+    uint32_t sampleUs,timerTop,deadTimeTicks;
+    uint16_t rawBattery,rawPanel,rawConverter,rawLoad,rawNtc;
+    uint8_t state,fault;
+    bool configured,powerGood,synchronous,loadEnabled;
+};
+volatile Telemetry telemetry={};
+// SWD commands: 1 START, 2 STOP, 3 CLEAR. Also available on optional UART2.
+volatile uint32_t command=0;
+volatile uint32_t heartbeatMs=0,lastHealthyMs=0;
+volatile bool heartbeatFault=false;
+uint32_t lastSampleUs=0,lastReportMs=0,lastPgFailMs=0;
+uint32_t pgGoodAtMs=0;
+bool pgWasGood=false;
+bool configured=false;
+float filteredBattery=0,filteredPanel=0,filteredConverter=0,filteredLoad=0;
+bool filtersReady=false;
+
+static void outputLow(uint32_t pin) {
+    digitalWrite(pin,LOW);pinMode(pin,OUTPUT);
+}
+static void safetyTick() {
+    ++heartbeatMs;
+    if(stage.active()&&uint32_t(heartbeatMs-lastHealthyMs)>20) {
+        stage.stop();GPIOC->BSRR=uint32_t(GPIO_PIN_13)<<16;
+        heartbeatFault=true;
+    }
+}
+static bool startWatchdog() {
+    RCC->CSR|=RCC_CSR_LSION;
+    const uint32_t start=millis();
+    while(!(RCC->CSR&RCC_CSR_LSIRDY))if(helios::elapsed(millis(),start,100))return false;
+    IWDG->KR=0x5555;IWDG->PR=4;IWDG->RLR=249; // ~500 ms at nominal 32 kHz /64.
+    IWDG->KR=0xCCCC;IWDG->KR=0xAAAA;
+    return true;
+}
+static uint16_t readAdc(uint32_t pin,unsigned count=4) {
+    analogRead(pin);
+    uint32_t sum=0;
+    for(unsigned i=0;i<count;++i)sum+=analogRead(pin);
+    return uint16_t((sum+count/2)/count);
+}
+static float adcVolts(uint16_t raw,float vdda) {return raw*vdda/4095.0f;}
+static helios::Sample measure(uint32_t nowMs) {
+    const uint32_t started=micros();
+    const uint16_t ref=readAdc(AVREF);
+    const float supply=ref?__LL_ADC_CALC_VREFANALOG_VOLTAGE(ref,LL_ADC_RESOLUTION_12B)/1000.0f*cfg::vddaCalibration:NAN;
+    const uint16_t bat=readAdc(PA0),pv=readAdc(PA1),conv=readAdc(PA6),load=readAdc(PA5),ntc=readAdc(PA7);
+    helios::Sample s;s.at=nowMs;
+    s.battery=adcVolts(bat,supply)*cfg::voltageRatio*cfg::batteryVoltageCalibration;
+    s.panel=adcVolts(pv,supply)*cfg::voltageRatio*cfg::panelVoltageCalibration;
+    const float offset=supply*2048.0f/4095.0f;
+    s.converter=(adcVolts(conv,supply)-offset-cfg::converterZeroCorrectionV)/(cfg::shuntOhm*cfg::currentGain);
+    s.load=(adcVolts(load,supply)-offset-cfg::loadZeroCorrectionV)/(cfg::shuntOhm*cfg::currentGain);
+    float resistance=NAN;s.temperature=NAN;
+    if(ntc>2&&ntc<4093) {
+        resistance=cfg::ntcPullup*ntc/(4095.0f-ntc);
+        s.temperature=1.0f/(1.0f/298.15f+logf(resistance/cfg::ntcR25)/cfg::ntcBeta)-273.15f;
+    }
+    s.valid=supply>2.9f&&supply<3.6f&&bat>2&&bat<4093&&pv<4093&&
+        conv>2&&conv<4093&&load>2&&load<4093&&ntc>2&&ntc<4093;
+    telemetry.vdda=supply;telemetry.rawBattery=bat;telemetry.rawPanel=pv;
+    telemetry.rawConverter=conv;telemetry.rawLoad=load;telemetry.rawNtc=ntc;
+    telemetry.ntcOhm=resistance;telemetry.temperatureC=s.temperature;
+    telemetry.sampleUs=micros()-started;
+    // Use raw extremes for shutdown before applying the slow telemetry filter.
+    if(configured&&s.valid) {
+        if(s.battery>=cfg::batteryTripVoltage)controller.trip(helios::Fault::Battery);
+        if(s.panel>=cfg::panelMaximum)controller.trip(helios::Fault::Panel);
+        if(s.converter>cfg::tripConverterA||s.load>cfg::tripLoadA)controller.trip(helios::Fault::Current);
+        if(s.converter<-.35f)controller.trip(helios::Fault::Reverse);
+    }
+    if(!filtersReady) {
+        filteredBattery=s.battery;filteredPanel=s.panel;
+        filteredConverter=s.converter;filteredLoad=s.load;filtersReady=true;
+    } else {
+        filteredBattery+=.25f*(s.battery-filteredBattery);filteredPanel+=.25f*(s.panel-filteredPanel);
+        filteredConverter+=.25f*(s.converter-filteredConverter);filteredLoad+=.25f*(s.load-filteredLoad);
+    }
+    if(!s.valid||!isfinite(s.battery)||!isfinite(s.panel))filtersReady=false;
+    s.battery=filteredBattery;s.panel=filteredPanel;s.converter=filteredConverter;s.load=filteredLoad;
+    telemetry.batteryV=s.battery;telemetry.panelV=s.panel;
+    telemetry.converterA=s.converter;telemetry.loadA=s.load;
+    return s;
+}
+static void executeCommand() {
+    if(cfg::uartTelemetry&&console.available()) {
+        const char c=console.read();
+        if(c=='s'||c=='S')command=1;
+        else if(c=='x'||c=='X')command=2;
+        else if(c=='c'||c=='C')command=3;
+    }
+    const uint32_t requested=command;command=0;
+    if(requested==1&&configured)controller.start();
+    if(requested==2){controller.stop();stage.stop();digitalWrite(PC13,LOW);}
+    if(requested==3) {
+        stage.stop();controller.clear();heartbeatFault=false;
+        lastHealthyMs=heartbeatMs;
+    }
+}
+void setup() {
+    outputLow(PB0);outputLow(PB1);outputLow(PC13);
+    outputLow(PB10);outputLow(PC14);outputLow(PA8);
+    pinMode(PC15,INPUT);
+    analogReadResolution(12);analogWriteResolution(12);
+    analogWrite(PA4,2048); // INA2181A1 reference; PA4 is a hardware DAC pin.
+    digitalWrite(PC14,HIGH); // PV DIVIDER enable, not power-stage enable.
+    digitalWrite(PB10,HIGH); // 5 V buck enable.
+    delay(50);
+    stage.begin();
+    telemetry.timerTop=stage.top();telemetry.deadTimeTicks=stage.gap();
+    configured=cfg::batteryConfirmed&&cfg::calibrationConfirmed&&stage.valid();
+    telemetry.configured=configured;
+    if(cfg::uartTelemetry)console.begin(115200);
+    heartbeatTimer.setOverflow(1000,HERTZ_FORMAT);
+    heartbeatTimer.attachInterrupt(safetyTick);heartbeatTimer.resume();
+    if(!startWatchdog()){configured=false;controller.trip(helios::Fault::Heartbeat);}
+    if(cfg::autoStart&&configured)controller.start();
+    lastSampleUs=micros();lastReportMs=millis();pgGoodAtMs=millis();
+}
+void loop() {
+    executeCommand();
+    if(heartbeatFault)controller.trip(helios::Fault::Heartbeat);
+    const uint32_t nowUs=micros(),nowMs=millis();
+    if(uint32_t(nowUs-lastSampleUs)>=1000) {
+        lastSampleUs=nowUs;
+        auto s=measure(nowMs);
+        const bool good=digitalRead(PC15)==LOW; // Q8 inverts U8 power-good.
+        telemetry.powerGood=good;
+        if(good) {lastPgFailMs=nowMs;if(!pgWasGood)pgGoodAtMs=nowMs;}
+        else {pgGoodAtMs=nowMs;if(pgWasGood)lastPgFailMs=nowMs;}
+        pgWasGood=good;
+        if(!good&&helios::elapsed(nowMs,lastPgFailMs,1000)&&configured)
+            controller.trip(helios::Fault::PowerGood);
+        auto result=controller.update(s,nowMs,configured);
+        // 100 ms of stable 5 V required before connecting loads or switching.
+        const bool allowed=good&&helios::elapsed(nowMs,pgGoodAtMs,100)&&!heartbeatFault;
+        bool synchronous=false;
+        if(cfg::synchronous&&result.duty>0) {
+            const float ripple=fmaxf(0,(s.panel-s.battery))*result.duty/(cfg::inductanceH*cfg::pwmHz);
+            synchronous=s.converter>ripple*.5f+.5f;
+        }
+        const uint32_t irq=__get_PRIMASK();__disable_irq();
+        if(!s.valid||result.state==helios::State::Fault||!allowed||heartbeatFault)stage.stop();
+        else {
+            lastHealthyMs=heartbeatMs;
+            stage.apply(result.duty,synchronous);
+        }
+        digitalWrite(PC13,result.load&&allowed?HIGH:LOW);
+        if(!irq)__enable_irq();
+        telemetry.state=uint8_t(result.state);telemetry.fault=uint8_t(result.fault);
+        telemetry.outputW=result.power;telemetry.batteryA=result.batteryCurrent;
+        telemetry.requestedDuty=result.duty;telemetry.appliedDuty=stage.active()?result.duty:0;
+        telemetry.synchronous=synchronous&&stage.active();telemetry.loadEnabled=result.load&&allowed;
+        // Both safety mechanisms are fed only after returning from a complete sample/control pass.
+        IWDG->KR=0xAAAA;
+    }
+    // PB10 remains enabled: switching this rail off would return the LDO to battery input.
+    if(cfg::uartTelemetry&&helios::elapsed(nowMs,lastReportMs,1000)) {
+        lastReportMs=nowMs;
+        console.print("state=");console.print(telemetry.state);
+        console.print(" fault=");console.print(telemetry.fault);
+        console.print(" battery=");console.print(telemetry.batteryV,3);
+        console.print(" panel=");console.print(telemetry.panelV,3);
+        console.print(" converterA=");console.print(telemetry.converterA,3);
+        console.print(" batteryA=");console.print(telemetry.batteryA,3);
+        console.print(" C=");console.print(telemetry.temperatureC,1);
+        console.print(" duty=");console.println(telemetry.appliedDuty,4);
+    }
+}

@@ -1,0 +1,23 @@
+Helios MPPT build verification — 2026-11-19
+
+Arduino CLI 1.4.1
+STM32 MCU based boards 3.1.0
+Target: STMicroelectronics:stm32:GenL0:pnum=GENERIC_L072CZTX,xserial=none,usb=none
+Warnings: all
+
+Default configuration:
+Sketch uses 33508 bytes (17%) of program storage space. Maximum is 196608 bytes.
+Global variables use 1828 bytes (8%) of dynamic memory. Maximum is 20480 bytes.
+Exit status 0. No compiler warnings emitted.
+
+Confirmed-battery/calibration compile configuration:
+compiler.cpp.extra_flags=-DHELIOS_BATTERY_CONFIRMED=1 -DHELIOS_CALIBRATION_CONFIRMED=1
+Sketch uses 33512 bytes (17%) of program storage space. Maximum is 196608 bytes.
+Global variables use 1828 bytes (8%) of dynamic memory. Maximum is 20480 bytes.
+Exit status 0. No compiler warnings emitted.
+
+Portable controller test, MSVC 14.51 /W4:
+Passed 25 checks; 88 duty settings checked in both count directions.
+No compiler warnings emitted.
+
+Both builds were compiled only. No upload, oscilloscope check or physical charging test was performed.
